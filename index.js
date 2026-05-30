@@ -1,10 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const app = express();
-
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-
 const API_KEY = process.env.PROSPEO_API_KEY;
 
 // Health check
@@ -62,7 +60,7 @@ app.post('/api/enrich', async (req, res) => {
     const response = await fetch('https://api.prospeo.io/enrich-person', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-KEY': API_KEY },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify({ data: req.body })
     });
     const data = await response.json();
     res.json(data);
@@ -70,5 +68,6 @@ app.post('/api/enrich', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
