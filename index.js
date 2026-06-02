@@ -59,18 +59,31 @@ app.post('/api/email-finder', async (req, res) => {
 app.post('/api/enrich', async (req, res) => {
   try {
     const { mode = 'email', ...personData } = req.body;
-
     const enrichOptions = {
       data: personData,
       only_verified_email: false,
       enrich_mobile: mode === 'phone' || mode === 'both',
       skip_email: mode === 'phone',
     };
-
     const response = await fetch('https://api.prospeo.io/enrich-person', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-KEY': API_KEY },
       body: JSON.stringify(enrichOptions)
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Search suggestions (autocomplete for location & job title)
+app.post('/api/suggestions', async (req, res) => {
+  try {
+    const response = await fetch('https://api.prospeo.io/search-suggestions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-KEY': API_KEY },
+      body: JSON.stringify(req.body)
     });
     const data = await response.json();
     res.json(data);
