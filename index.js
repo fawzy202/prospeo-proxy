@@ -5,8 +5,23 @@ const express = require('express');
 const crypto = require('crypto');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const Stripe = require('stripe');
 
 const PROSPEO_KEY = process.env.PROSPEO_API_KEY;
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, ''); // e.g. https://leadhunt.ae
+const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY) : null;
+
+// Plans live HERE (the server never trusts prices sent by the browser)
+const PLANS = {
+  Starter:    { credits: 100,  price: 19 },
+  Pro:        { credits: 200,  price: 35 },
+  Business:   { credits: 2000, price: 179 },
+  Enterprise: { credits: 4000, price: 299 },
+};
+const YEAR_DISCOUNT = 0.10;
+const MIN_MONTHS_YEARLY = 6;   // yearly (discounted) plans: cancel before this many paid months = early cancellation fee of ONE month
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'fawzi.muhammad20@gmail.com').toLowerCase();
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -22,6 +37,72 @@ const FieldValue = admin.firestore.FieldValue;
 const app = express();
 app.set('trust proxy', true); // Render sits behind a proxy: needed to read the real client IP
 app.use(cors({ origin: '*' }));
+
+// ---------- Stripe webhook (raw body required, so it comes before express.json) ----------
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(500).send('Stripe not configured');
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    console.error('Webhook signature failed:', e.message);
+    return res.status(400).send('Bad signature');
+  }
+  try {
+    if (event.type === 'invoice.paid') {
+      const invoice = event.data.object;
+
+      // One-time early-cancellation fee (created by /api/cancel): only record revenue, never add credits
+      if (invoice.metadata && invoice.metadata.type === 'early_cancel_fee') {
+        const feeUid = invoice.metadata.uid;
+        const feeAmount = (invoice.amount_paid || 0) / 100;
+        const feeRef = db.collection('payments').doc(invoice.id);
+        await db.runTransaction(async (t) => {
+          const done = await t.get(feeRef);
+          if (done.exists) return;
+          t.set(feeRef, { uid: feeUid, type: 'early_cancel_fee', amount: feeAmount, at: FieldValue.serverTimestamp() });
+          if (feeUid) t.set(db.collection('users').doc(feeUid), { totalPaid: FieldValue.increment(feeAmount) }, { merge: true });
+        });
+        return res.json({ received: true });
+      }
+      const subId = invoice.subscription || (invoice.parent && invoice.parent.subscription_details && invoice.parent.subscription_details.subscription);
+      let meta = (invoice.parent && invoice.parent.subscription_details && invoice.parent.subscription_details.metadata) || {};
+      if ((!meta.uid || !meta.plan) && subId) {
+        const sub = await stripe.subscriptions.retrieve(typeof subId === 'string' ? subId : subId.id);
+        meta = sub.metadata || {};
+      }
+      const uid = meta.uid;
+      const plan = PLANS[meta.plan];
+      if (!uid || !plan) { console.error('invoice.paid without usable metadata', invoice.id); return res.json({ received: true }); }
+      const credits = plan.credits;   // every paid month (monthly or yearly-commitment) grants the plan's monthly credits
+      const amount = (invoice.amount_paid || 0) / 100;
+
+      // idempotent: a paid invoice is only credited once
+      const payRef = db.collection('payments').doc(invoice.id);
+      await db.runTransaction(async (t) => {
+        const done = await t.get(payRef);
+        if (done.exists) return;
+        t.set(payRef, { uid, plan: meta.plan, billing: meta.billing || 'monthly', credits, amount, email: invoice.customer_email || null, at: FieldValue.serverTimestamp() });
+        const userUpdate = {
+          credits: FieldValue.increment(credits),
+          totalPaid: FieldValue.increment(amount),
+          stripeCustomerId: invoice.customer || null,
+          plan: meta.plan,
+          billing: meta.billing || 'monthly',
+        };
+        userUpdate.paidMonths = invoice.billing_reason === 'subscription_create' ? 1 : FieldValue.increment(1);
+        userUpdate.cancelAtPeriodEnd = false;
+        if (subId) userUpdate.stripeSubscriptionId = typeof subId === 'string' ? subId : subId.id;
+        t.set(db.collection('users').doc(uid), userUpdate, { merge: true });
+      });
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error('Webhook handler error:', e);
+    res.status(500).send('Handler error'); // Stripe will retry
+  }
+});
+
 app.use(express.json({ limit: '100kb' }));
 
 // ---------- helpers ----------
@@ -301,6 +382,154 @@ app.post('/api/suggestions', requireAuth, rateLimit, async (req, res) => {
     if (b.location_search) body.location_search = String(b.location_search).slice(0, 100);
     if (b.job_title_search) body.job_title_search = String(b.job_title_search).slice(0, 100);
     res.json(await prospeo('search-suggestions', body));
+  } catch (e) { handleErr(res, e); }
+});
+
+
+// ---------- payments ----------
+// Start a Stripe Checkout (subscription). Plan + price are decided here, not by the browser.
+app.post('/api/checkout', requireAuth, requireVerified, rateLimit, async (req, res) => {
+  try {
+    if (!stripe || !SITE_URL) return fail(res, 503, 'PAYMENTS_OFF', 'Payments are not configured yet.');
+    const planId = req.body && req.body.plan;
+    const billing = req.body && req.body.billing === 'yearly' ? 'yearly' : 'monthly';
+    const plan = PLANS[planId];
+    if (!plan) return fail(res, 400, 'BAD_PLAN', 'Unknown plan');
+    // yearly plan = billed MONTHLY at the discounted price
+    const cents = billing === 'yearly' ? Math.round(plan.price * (1 - YEAR_DISCOUNT) * 100) : plan.price * 100;
+    const meta = { uid: req.user.uid, plan: planId, billing };
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: req.user.email,
+      client_reference_id: req.user.uid,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: cents,
+          recurring: { interval: 'month' },
+          product_data: {
+            name: 'LeadHunt ' + planId + (billing === 'yearly' ? ' (billed monthly, 10% off)' : ' (Monthly)'),
+            description: plan.credits + ' credits / month',
+          },
+        },
+      }],
+      metadata: meta,
+      subscription_data: { metadata: meta },
+      success_url: SITE_URL + '/?paid=1',
+      cancel_url: SITE_URL + '/?canceled=1',
+    });
+    res.json({ url: session.url });
+  } catch (e) { handleErr(res, e); }
+});
+
+// Stripe's hosted page: change card / see invoices / cancel.
+// Cancel works for everyone: it ends the plan at the END of the month already paid (no refund for the current month).
+const portalCache = {};
+async function portalConfigId(committed) {
+  const key = committed ? 'committed' : 'standard';
+  if (portalCache[key]) return portalCache[key];
+  const list = await stripe.billingPortal.configurations.list({ limit: 100, is_active: true });
+  let found = list.data.find((c) => c.metadata && c.metadata.leadhunt === key);
+  if (!found) {
+    found = await stripe.billingPortal.configurations.create({
+      business_profile: { headline: 'LeadHunt subscription' },
+      features: {
+        invoice_history: { enabled: true },
+        payment_method_update: { enabled: true },
+        customer_update: { enabled: true, allowed_updates: ['email', 'name', 'address'] },
+        subscription_cancel: committed ? { enabled: false } : { enabled: true, mode: 'at_period_end' },
+      },
+      metadata: { leadhunt: key },
+    });
+  }
+  portalCache[key] = found.id;
+  return found.id;
+}
+
+app.post('/api/portal', requireAuth, requireVerified, rateLimit, async (req, res) => {
+  try {
+    if (!stripe || !SITE_URL) return fail(res, 503, 'PAYMENTS_OFF', 'Payments are not configured yet.');
+    const snap = await db.collection('users').doc(req.user.uid).get();
+    const u = snap.exists ? snap.data() : {};
+    if (!u.stripeCustomerId) return fail(res, 404, 'NO_SUBSCRIPTION', 'No active subscription found.');
+    const committed = true; // portal = card + invoices only. Cancelling goes through /api/cancel (it may need an early-cancellation fee)
+    const session = await stripe.billingPortal.sessions.create({
+      customer: u.stripeCustomerId,
+      return_url: SITE_URL,
+      configuration: await portalConfigId(committed),
+    });
+    res.json({ url: session.url, committed });
+  } catch (e) { handleErr(res, e); }
+});
+
+// ---------- cancellation ----------
+// Monthly plan: cancel anytime. Yearly (discounted) plan: if cancelled before MIN_MONTHS_YEARLY paid months,
+// a one-time fee of ONE month is charged. In every case the plan stays active until the end of the month already paid.
+function cancelQuote(u) {
+  const plan = PLANS[u.plan];
+  const paidMonths = Number(u.paidMonths) || 0;
+  const yearly = u.billing === 'yearly';
+  const early = yearly && paidMonths < MIN_MONTHS_YEARLY;
+  const feeCents = early && plan ? Math.round(plan.price * (1 - YEAR_DISCOUNT) * 100) : 0;
+  return { plan: u.plan || null, billing: u.billing || 'monthly', paidMonths, minMonths: MIN_MONTHS_YEARLY, feeCents, fee: feeCents / 100 };
+}
+
+app.post('/api/cancel-info', requireAuth, requireVerified, rateLimit, async (req, res) => {
+  try {
+    const snap = await db.collection('users').doc(req.user.uid).get();
+    const u = snap.exists ? snap.data() : {};
+    if (!u.stripeSubscriptionId) return fail(res, 404, 'NO_SUBSCRIPTION', 'No active subscription found.');
+    if (u.cancelAtPeriodEnd) return fail(res, 409, 'ALREADY_CANCELED', 'Your subscription is already set to end.');
+    res.json(cancelQuote(u));
+  } catch (e) { handleErr(res, e); }
+});
+
+app.post('/api/cancel', requireAuth, requireVerified, rateLimit, async (req, res) => {
+  try {
+    if (!stripe) return fail(res, 503, 'PAYMENTS_OFF', 'Payments are not configured yet.');
+    const userRef = db.collection('users').doc(req.user.uid);
+    const snap = await userRef.get();
+    const u = snap.exists ? snap.data() : {};
+    if (!u.stripeSubscriptionId || !u.stripeCustomerId) return fail(res, 404, 'NO_SUBSCRIPTION', 'No active subscription found.');
+    if (u.cancelAtPeriodEnd) return fail(res, 409, 'ALREADY_CANCELED', 'Your subscription is already set to end.');
+
+    const quote = cancelQuote(u);
+    const sub = await stripe.subscriptions.retrieve(u.stripeSubscriptionId);
+    if (sub.status === 'canceled') return fail(res, 409, 'ALREADY_CANCELED', 'Subscription already ended.');
+
+    // 1) early-cancellation fee (charged first; if the card fails, nothing is cancelled)
+    if (quote.feeCents > 0) {
+      await stripe.invoiceItems.create({
+        customer: u.stripeCustomerId,
+        amount: quote.feeCents,
+        currency: 'usd',
+        description: 'Early cancellation fee (yearly plan cancelled before ' + MIN_MONTHS_YEARLY + ' months)',
+      });
+      let invoice = await stripe.invoices.create({
+        customer: u.stripeCustomerId,
+        collection_method: 'charge_automatically',
+        auto_advance: false,
+        pending_invoice_items_behavior: 'include',
+        default_payment_method: typeof sub.default_payment_method === 'string' ? sub.default_payment_method : (sub.default_payment_method && sub.default_payment_method.id) || undefined,
+        metadata: { type: 'early_cancel_fee', uid: req.user.uid },
+      });
+      try {
+        invoice = await stripe.invoices.finalizeInvoice(invoice.id);
+        await stripe.invoices.pay(invoice.id);
+      } catch (payErr) {
+        await stripe.invoices.voidInvoice(invoice.id).catch(() => {});
+        return fail(res, 402, 'FEE_PAYMENT_FAILED', 'Could not charge the early cancellation fee. Please update your card and try again.');
+      }
+    }
+
+    // 2) end the plan after the month that is already paid
+    const updated = await stripe.subscriptions.update(u.stripeSubscriptionId, { cancel_at_period_end: true });
+    await userRef.set({
+      cancelAtPeriodEnd: true,
+      cancelEffective: updated.cancel_at ? admin.firestore.Timestamp.fromMillis(updated.cancel_at * 1000) : null,
+    }, { merge: true });
+    res.json({ ok: true, fee: quote.fee, endsAt: updated.cancel_at ? updated.cancel_at * 1000 : null });
   } catch (e) { handleErr(res, e); }
 });
 
