@@ -102,6 +102,48 @@ const handleErr = (res, e) => {
   return fail(res, 500, 'SERVER_ERROR', e.message || 'Server error');
 };
 
+
+// Prospeo returns FULL emails/phones for people already revealed on OUR Prospeo account
+// (e.g. from our own tests). Hide them so users must pay a credit to reveal.
+function maskEmail(e) {
+  const [l, d] = String(e).split('@');
+  return (l ? l[0] : '') + '*****' + (d ? '@' + d : '');
+}
+function maskPhone(ph) {
+  const s = String(ph);
+  return s.length > 4 ? s.slice(0, 4) + '*'.repeat(Math.max(s.length - 4, 4)) : '****';
+}
+function maskResults(d) {
+  if (!d || !Array.isArray(d.results)) return d;
+  d.results.forEach((r) => {
+    const p = r && r.person;
+    if (!p) return;
+    if (p.email && p.email.email && !String(p.email.email).includes('*')) p.email.email = maskEmail(p.email.email);
+    if (p.mobile && p.mobile.mobile && !String(p.mobile.mobile).includes('*')) p.mobile.mobile = maskPhone(p.mobile.mobile);
+  });
+  return d;
+}
+
+
+// Contacts a user already revealed are saved at users/{uid}/revealed/{person_id} (server-only access).
+const revealedRef = (uid, personId) =>
+  db.collection('users').doc(uid).collection('revealed').doc(String(personId).replace(/\//g, '_'));
+
+async function applyRevealed(uid, d) {
+  if (!d || !Array.isArray(d.results) || !d.results.length) return d;
+  const withId = d.results.filter((r) => r && r.person && r.person.person_id);
+  if (!withId.length) return d;
+  const snaps = await db.getAll(...withId.map((r) => revealedRef(uid, r.person.person_id)));
+  snaps.forEach((snap, i) => {
+    if (!snap.exists) return;
+    const saved = snap.data();
+    const p = withId[i].person;
+    if (saved.email && saved.email.email) p.email = saved.email;
+    if (saved.mobile && saved.mobile.mobile) p.mobile = saved.mobile;
+  });
+  return d;
+}
+
 // ---------- routes ----------
 app.get('/', (req, res) => res.json({ status: 'LeadHunt API running' }));
 
@@ -178,6 +220,8 @@ app.post('/api/search', requireAuth, requireVerified, rateLimit, async (req, res
     const ok = !d.error && Array.isArray(d.results) && d.results.length > 0;
     if (!ok) { await refund(uid, 1); reserved = false; return res.json(d); }
     d._charged = 1;
+    maskResults(d);
+    await applyRevealed(uid, d);   // contacts THIS user already paid for stay visible
     res.json(d);
   } catch (e) {
     if (reserved) await refund(uid, 1).catch(() => {});
@@ -185,7 +229,8 @@ app.post('/api/search', requireAuth, requireVerified, rateLimit, async (req, res
   }
 });
 
-// Reveal: email 1 credit, phone 10 credits — each charged only if actually found
+// Reveal: email 1 credit, phone 10 credits — each charged only if actually found.
+// Anything this user already revealed before is free to see again.
 app.post('/api/enrich', requireAuth, requireVerified, rateLimit, async (req, res) => {
   const uid = req.user.uid;
   let reservedAmount = 0;
@@ -195,23 +240,51 @@ app.post('/api/enrich', requireAuth, requireVerified, rateLimit, async (req, res
     if (!personId || typeof personId !== 'string') return fail(res, 400, 'BAD_REQUEST', 'person_id required');
     const wantEmail = mode !== 'phone';
     const wantPhone = mode !== 'email';
-    const maxCost = (wantEmail ? 1 : 0) + (wantPhone ? 10 : 0);
 
+    const ref = revealedRef(uid, personId);
+    const savedSnap = await ref.get();
+    const saved = savedSnap.exists ? savedSnap.data() : {};
+    const haveEmail = !!(saved.email && saved.email.email);
+    const havePhone = !!(saved.mobile && saved.mobile.mobile);
+    const needEmail = wantEmail && !haveEmail;
+    const needPhone = wantPhone && !havePhone;
+
+    // Already revealed by this user: show it again, no charge, no Prospeo call
+    if (!needEmail && !needPhone) {
+      return res.json({ error: false, response: { person: { email: saved.email, mobile: saved.mobile } }, _charged: 0, _cached: true });
+    }
+
+    const maxCost = (needEmail ? 1 : 0) + (needPhone ? 10 : 0);
     await reserve(uid, maxCost);
     reservedAmount = maxCost;
 
     const d = await prospeo('enrich-person', {
       data: { person_id: personId },
       only_verified_email: false,
-      enrich_mobile: wantPhone,
-      skip_email: !wantEmail,
+      enrich_mobile: needPhone,
+      skip_email: !needEmail,
     });
     const p = (d.response && d.response.person) || d.person || {};
     const gotEmail = !!(p.email && p.email.email);
     const gotPhone = !!(p.mobile && p.mobile.mobile);
-    const charge = (wantEmail && gotEmail ? 1 : 0) + (wantPhone && gotPhone ? 10 : 0);
+    const charge = (needEmail && gotEmail ? 1 : 0) + (needPhone && gotPhone ? 10 : 0);
     await refund(uid, maxCost - charge);
     reservedAmount = 0;
+
+    // remember what this user paid for
+    const toSave = {};
+    if (needEmail && gotEmail) toSave.email = p.email;
+    if (needPhone && gotPhone) toSave.mobile = p.mobile;
+    if (Object.keys(toSave).length) {
+      toSave.updatedAt = FieldValue.serverTimestamp();
+      await ref.set(toSave, { merge: true });
+    }
+
+    // answer with everything this user now has for this person
+    const merged = Object.assign({}, p);
+    if (!gotEmail && haveEmail) merged.email = saved.email;
+    if (!gotPhone && havePhone) merged.mobile = saved.mobile;
+    if (d.response) d.response.person = merged; else d.person = merged;
     d._charged = charge;
     res.json(d);
   } catch (e) {
